@@ -3,6 +3,7 @@ import _ from "lodash";
 import { toBN } from "../test/helpers/helpers";
 import maticAddresses from "../config/matic.json";
 import cfaABI from "../abis/IConstantFlowAgreementV1.json";
+import superTokenABI from "../abis/ISuperToken.json";
 import idaABI from "../abis/IInstantDistributionAgreementV1.json";
 import {
     getIndexes,
@@ -21,6 +22,9 @@ import { ConstantFlowAgreementV1 } from "../typechain/ConstantFlowAgreementV1";
 import { InstantDistributionAgreementV1 } from "../typechain/InstantDistributionAgreementV1";
 import request, { gql } from "graphql-request";
 import { IMeta } from "../test/interfaces";
+import { getBalance } from "./utils";
+import { Provider } from "@ethersproject/abstract-provider";
+import { SuperToken } from "../typechain";
 
 const subgraphRequest = async <T>(
     query: string,
@@ -135,6 +139,69 @@ const validateATSNetFlowRate = async (
     }
 };
 
+const validateATSBalance = async (
+    idaV1: InstantDistributionAgreementV1,
+    tokenAddress: string,
+    ats: IDataIntegrityAccountTokenSnapshot,
+    currentTimestamp: number,
+    currentBlockNumber: number,
+    subscriptions: IDataIntegritySubscription[],
+    provider: Provider
+) => {
+    try {
+        const userSubscriptions = subscriptions.filter(
+            (x) =>
+                x.subscriber.id === ats.account.id &&
+                x.index.token.id === tokenAddress
+        );
+        const promises = userSubscriptions.map((x) =>
+            idaV1.getSubscription(
+                tokenAddress,
+                x.index.publisher.id,
+                x.index.indexId,
+                x.subscriber.id
+            )
+        );
+        const datas = await Promise.all(promises);
+
+        const totalClaimable = datas
+            .map((x) => x.pendingDistribution)
+            .reduce((x, y) => x.add(y), toBN(0));
+
+        const tokenContract = new ethers.Contract(
+            tokenAddress,
+            superTokenABI,
+            provider
+        ) as SuperToken;
+        const { availableBalance } = await tokenContract.realtimeBalanceOf(
+            ats.account.id,
+            currentTimestamp,
+            { blockTag: currentBlockNumber }
+        );
+        const web3Balance = totalClaimable.add(availableBalance);
+        // validate subgraph calculated balance = realtimebalance + claimable (not sure how we get this from contracts)
+        const calculatedSubgraphBalance = getBalance({
+            currentBalance: ats.balanceUntilUpdatedAt,
+            netFlowRate: ats.totalNetFlowRate,
+            currentTimestamp: currentTimestamp.toString(),
+            updatedAtTimestamp: ats.updatedAtTimestamp,
+            indexSubscriptions: userSubscriptions,
+        });
+
+        if (!web3Balance.eq(calculatedSubgraphBalance)) {
+            throw new Error(
+                "Web3 RealtimeBalance + total claimable amount is not the same as the calculated subgraph balance" +
+                    "\n Web3: " +
+                    web3Balance.toString() +
+                    " \n Subgraph: " +
+                    calculatedSubgraphBalance.toString()
+            );
+        }
+    } catch (err) {
+        console.error(err);
+    }
+};
+
 const validateStreamData = async (
     cfaV1: ConstantFlowAgreementV1,
     stream: IDataIntegrityStream,
@@ -195,6 +262,62 @@ const validateIndexData = async (
         const totalUnitsPendingShouldMatch = toBN(index.totalUnitsPending).eq(
             totalUnitsPending
         );
+        const totalUnits = totalUnitsApproved.add(totalUnitsPending);
+
+        // Check that Index total units on both subgraph and web3 is equal to sum of Index.subscription units
+        const totalSubscriptionApprovedUnits = index.subscriptions
+            .filter((x) => x.approved)
+            .reduce((x, y) => x.add(toBN(y.units)), toBN(0));
+        const totalSubscriptionPendingUnits = index.subscriptions
+            .filter((x) => !x.approved)
+            .reduce((x, y) => x.add(toBN(y.units)), toBN(0));
+        const totalSubscriptionUnits = totalSubscriptionApprovedUnits.add(
+            totalSubscriptionPendingUnits
+        );
+        const totalApprovedUnitsAreEqual =
+            totalSubscriptionApprovedUnits.eq(totalUnitsApproved) &&
+            totalSubscriptionApprovedUnits.eq(toBN(index.totalUnitsApproved));
+        const totalPendingUnitsAreEqual =
+            totalSubscriptionPendingUnits.eq(totalUnitsPending) &&
+            totalSubscriptionPendingUnits.eq(toBN(index.totalUnitsPending));
+        const totalUnitsAreEqual =
+            totalSubscriptionUnits.eq(totalUnits) &&
+            totalSubscriptionUnits.eq(toBN(index.totalUnits));
+
+        if (!totalApprovedUnitsAreEqual) {
+            throw new Error(
+                "Total approved units not equal: " +
+                    "\n TotalSubscriptionApprovedUnits: " +
+                    totalSubscriptionApprovedUnits.toString() +
+                    "\n totalUnitsApproved (subgraph): " +
+                    index.totalUnitsApproved +
+                    "\n totalUnitsApproved (web3): " +
+                    totalUnitsApproved.toString()
+            );
+        }
+        if (!totalPendingUnitsAreEqual) {
+            throw new Error(
+                "Total approved units not equal: " +
+                    "\n TotalSubscriptionPendingUnits: " +
+                    totalSubscriptionPendingUnits.toString() +
+                    "\n totalUnitsPending (subgraph): " +
+                    index.totalUnitsPending +
+                    "\n totalUnitsPending (web3): " +
+                    totalUnitsPending.toString()
+            );
+        }
+        if (!totalUnitsAreEqual) {
+            throw new Error(
+                "Total approved units not equal: " +
+                    "\n TotalSubscriptionUnits: " +
+                    totalSubscriptionUnits.toString() +
+                    "\n totalUnits (subgraph): " +
+                    index.totalUnits +
+                    "\n totalUnits (web3): " +
+                    totalUnits.toString()
+            );
+        }
+
         const compareIndex = {
             id: index.id,
             indexValue: index.indexValue,
@@ -365,12 +488,18 @@ const validateIDAData = async (
         await Promise.all(chunkedSubscriptionPromises[i]);
     }
     console.log("Subscription Tests Successful!");
+
+    return { indexes, subscriptions };
 };
 
 const validateAggregateEntityData = async (
+    idaV1: InstantDistributionAgreementV1,
     cfaV1: ConstantFlowAgreementV1,
     uniqueStreams: IDataIntegrityStream[],
-    currentBlockNumber: number
+    currentTimestamp: number,
+    currentBlockNumber: number,
+    subscriptions: IDataIntegritySubscription[],
+    provider: Provider
 ) => {
     const uniqueAccountTokenSnapshots = _.uniqBy(
         uniqueStreams
@@ -389,24 +518,51 @@ const validateAggregateEntityData = async (
         (x, y) => x + Number(y.totalNetFlowRate),
         0
     );
-    
+
     if (sumNetFlows !== 0) {
         throw new Error("Sum of CFA total netflow !== zero");
     }
     console.log("Sum of CFA total netflow === zero is true");
 
-    const accountTokenSnapshotPromises = uniqueAccountTokenSnapshots.map((x) =>
-        validateATSNetFlowRate(cfaV1, x, currentBlockNumber)
+    const accountTokenSnapshotBalancePromises = uniqueAccountTokenSnapshots.map(
+        (x) =>
+            validateATSBalance(
+                idaV1,
+                x.token.id,
+                x,
+                currentBlockNumber,
+                currentTimestamp,
+                subscriptions,
+                provider
+            )
     );
-    const chunkedATSPromises = chunkPromises(accountTokenSnapshotPromises, 100);
+
+    const chunkedATSBalancePromises = chunkPromises(
+        accountTokenSnapshotBalancePromises,
+        100
+    );
+
+    const accountTokenSnapshotNetflowPromises = uniqueAccountTokenSnapshots.map(
+        (x) => validateATSNetFlowRate(cfaV1, x, currentBlockNumber)
+    );
+    const chunkedATSNetFlowPromises = chunkPromises(
+        accountTokenSnapshotNetflowPromises,
+        100
+    );
     console.log("Account Token Snapshot Tests Starting...");
     console.log(
         "Validating " +
-            accountTokenSnapshotPromises.length +
+            accountTokenSnapshotNetflowPromises.length +
             " account token snapshots."
     );
-    for (let i = 0; i < chunkedATSPromises.length; i++) {
-        await Promise.all(chunkedATSPromises[i]);
+    console.log("Validating ATS Net flows...");
+    for (let i = 0; i < chunkedATSNetFlowPromises.length; i++) {
+        await Promise.all(chunkedATSNetFlowPromises[i]);
+    }
+
+    console.log("Validating ATS Balances...");
+    for (let i = 0; i < chunkedATSBalancePromises.length; i++) {
+        await Promise.all(chunkedATSBalancePromises[i]);
     }
     console.log("Account Token Snapshot Tests Successful!");
 };
@@ -414,6 +570,8 @@ const validateAggregateEntityData = async (
 const main = async () => {
     try {
         const network = await ethers.provider.getNetwork();
+        const [signer] = await ethers.getSigners();
+        const provider = signer.provider!;
         const chainId = network.chainId;
         const chainIdData = chainIdToData.get(chainId);
         if (chainIdData == null) {
@@ -425,12 +583,15 @@ const main = async () => {
         const currentBlockNumber = await getMostRecentIndexedBlockNumber(
             chainIdData.subgraphAPIEndpoint
         );
+        const block = await ethers.provider.getBlock(currentBlockNumber);
+        const currentTimestamp = block.timestamp;
         console.log(
             "Executing Subgraph Data Integrity Test on " +
                 chainIdData.name +
                 " network."
         );
         console.log("Current block number used to query: ", currentBlockNumber);
+        console.log("Current timestamp at block: ", currentTimestamp);
 
         const cfaV1 = (await ethers.getContractAt(
             cfaABI,
@@ -446,12 +607,20 @@ const main = async () => {
             currentBlockNumber
         );
 
-        await validateIDAData(idaV1, chainIdData, currentBlockNumber);
+        const { subscriptions } = await validateIDAData(
+            idaV1,
+            chainIdData,
+            currentBlockNumber
+        );
 
         await validateAggregateEntityData(
+            idaV1,
             cfaV1,
             uniqueStreams,
-            currentBlockNumber
+            currentTimestamp,
+            currentBlockNumber,
+            subscriptions,
+            provider
         );
     } catch (err) {
         console.error(err);

@@ -66,6 +66,10 @@ export const getIndexes = gql`
             publisher {
                 id
             }
+            subscriptions {
+                approved
+                units
+            }
         }
     }
 `;

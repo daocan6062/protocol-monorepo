@@ -17,6 +17,11 @@ export interface IDataIntegrityStream extends IBaseEntity {
     readonly receiver: ILightStreamAccount;
 }
 
+export interface IDataIntegrityIndexSubscription {
+    readonly units: string;
+    readonly approved: boolean;
+}
+
 export interface IDataIntegrityIndex extends IBaseEntity {
     readonly indexId: string;
     readonly indexValue: string;
@@ -25,6 +30,7 @@ export interface IDataIntegrityIndex extends IBaseEntity {
     readonly totalUnits: string;
     readonly token: ILightEntity;
     readonly publisher: ILightEntity;
+    readonly subscriptions: IDataIntegrityIndexSubscription[];
 }
 
 export interface IDataIntegritySubscription extends IBaseEntity {
@@ -41,6 +47,17 @@ export interface IDataIntegritySubscription extends IBaseEntity {
 }
 
 export interface IDataIntegrityAccountTokenSnapshot {
+    readonly updatedAtTimestamp: string;
+    readonly updatedAtBlockNumber: string;
+    readonly totalNumberOfActiveStreams: number;
+    readonly totalNumberOfClosedStreams: number;
+    readonly totalSubscriptionsWithUnits: string;
+    readonly totalApprovedSubscriptions: number;
+    readonly balanceUntilUpdatedAt: string;
+    readonly totalInflowRate: string;
+    readonly totalOutflowRate: string;
+    readonly totalAmountStreamedUntilUpdatedAt: string;
+    readonly totalAmountTransferredUntilUpdatedAt: string;
     readonly totalNetFlowRate: string;
     readonly token: ILightEntity;
     readonly account: ILightEntity;
